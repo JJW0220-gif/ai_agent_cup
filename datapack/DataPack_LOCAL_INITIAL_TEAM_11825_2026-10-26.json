@@ -1,0 +1,28 @@
+{
+  "schema_version": "3.0",
+  "doc_type": "DataPack",
+  "team_id": "TEAM_11825",
+  "trade_date": "2026-10-26",
+  "as_of_date": null,
+  "generated_at": "2026-10-21T09:19:10+08:00",
+  "missing": [],
+  "prev_day_orders": {
+    "outcome": "none",
+    "void_reasons": [],
+    "excluded_codes": []
+  },
+  "account": {
+    "cash": 1000000000.0,
+    "cash_ratio_tradable": 1.0,
+    "nav_tradable": 1000000000.0,
+    "aum": 1000000000.0,
+    "receivable_cash": 0.0,
+    "holdings_count": 0
+  },
+  "holdings": [],
+  "compliance": {
+    "violations": 0,
+    "notices": 0,
+    "incidents": []
+  }
+}

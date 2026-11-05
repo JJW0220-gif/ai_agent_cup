@@ -10,18 +10,26 @@ from pathlib import Path
 from typing import Any
 
 from ai_cup_agent.models import Portfolio, Quote
-from ai_cup_agent.dplan import build_dplan_draft, portfolio_from_datapack
-from ai_cup_agent.fetch_benchmarks import (
-    MAX_SNAPSHOT_AGE_DAYS,
-    SOURCE_KIND,
-    SOURCE_ROOT,
-    fetch_benchmarks,
+from ai_cup_agent.dplan import (
+    build_dplan_draft,
+    nav_values_match,
+    portfolio_from_datapack,
 )
 from ai_cup_agent.gemini import DEFAULT_MODEL, score_quotes
-from ai_cup_agent.rules import validate_benchmarks
 from ai_cup_agent.strategy import build_decision
 from ai_cup_agent.dplan_validation import validate_dplan
-from ai_cup_agent.market_data import MarketSnapshot, fetch_official_market_snapshot
+from ai_cup_agent.market_data import (
+    MarketSnapshot,
+    TPEX_HISTORY_URL,
+    TWSE_DAILY_URL,
+    fetch_official_market_snapshot,
+    fetch_official_price_history,
+)
+from ai_cup_agent.technicals import (
+    DailyBar,
+    TechnicalIndicators,
+    calculate_universe_indicators,
+)
 
 
 def _read_json(path: Path) -> Any:
@@ -42,6 +50,54 @@ def _read_quotes(path: Path) -> dict[str, Quote]:
                 score=Decimal(row.get("score") or "0"),
             )
     return quotes
+
+
+def _read_history(
+    path: Path,
+    symbols: set[str],
+) -> dict[str, list[DailyBar]]:
+    history: dict[str, list[DailyBar]] = {symbol: [] for symbol in symbols}
+    seen: set[tuple[str, date]] = set()
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"symbol", "date", "high", "low", "close", "volume"}
+        if reader.fieldnames is None or required - set(reader.fieldnames):
+            missing = sorted(required - set(reader.fieldnames or []))
+            raise ValueError(
+                "Historical CSV is missing columns: " + ", ".join(missing)
+            )
+        for row in reader:
+            symbol = row["symbol"].strip()
+            if symbol not in symbols:
+                continue
+            try:
+                bar_date = date.fromisoformat(row["date"].strip())
+                high = Decimal(row["high"])
+                low = Decimal(row["low"])
+                close = Decimal(row["close"])
+                volume = Decimal(row["volume"])
+            except (ArithmeticError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Historical CSV has invalid data for {symbol}."
+                ) from error
+            if any(not value.is_finite() for value in (high, low, close, volume)):
+                raise ValueError(
+                    f"Historical CSV has non-finite data for {symbol}."
+                )
+            if high <= 0 or low <= 0 or close <= 0 or high < low or volume < 0:
+                raise ValueError(
+                    f"Historical CSV has invalid OHLCV values for {symbol}."
+                )
+            key = (symbol, bar_date)
+            if key in seen:
+                raise ValueError(
+                    f"Historical CSV has duplicate row for {symbol} on {bar_date}."
+                )
+            seen.add(key)
+            history[symbol].append(
+                DailyBar(bar_date, high, low, close, volume)
+            )
+    return history
 
 
 def _combine_evidence(
@@ -87,60 +143,6 @@ def _read_universe(path: Path) -> set[str]:
     return symbols
 
 
-def _read_benchmarks(
-    path: Path,
-    expected_benchmarks: set[str],
-    *,
-    allow_stale: bool = False,
-) -> tuple[dict[str, dict[str, Decimal]], dict[str, dict[str, str]]]:
-    rows = _read_json(path)
-    if not isinstance(rows, dict) or rows.get("source") != SOURCE_ROOT:
-        raise ValueError("Benchmark file must include the expected ETFInfo source metadata.")
-    if rows.get("source_kind") != SOURCE_KIND:
-        raise ValueError(f"Benchmark source must be marked {SOURCE_KIND}.")
-    retrieved_at = rows.get("retrieved_at")
-    if not isinstance(retrieved_at, str):
-        raise ValueError("Benchmark file is missing its retrieval timestamp.")
-    try:
-        datetime.fromisoformat(retrieved_at)
-    except ValueError as error:
-        raise ValueError("Benchmark retrieval timestamp is not valid ISO 8601.") from error
-    raw_benchmarks = rows.get("benchmarks")
-    if not isinstance(raw_benchmarks, dict):
-        raise ValueError("Benchmark file must contain a benchmarks object.")
-    benchmarks: dict[str, dict[str, Decimal]] = {}
-    metadata: dict[str, dict[str, str]] = {}
-    for name, record in raw_benchmarks.items():
-        if not isinstance(record, dict):
-            raise ValueError(f"Benchmark {name} must include snapshot metadata.")
-        if not isinstance(record.get("weights"), dict):
-            raise ValueError(f"Benchmark {name} must include its stock weights.")
-        source_url = record.get("source_url")
-        expected_url = f"{SOURCE_ROOT}/etf/{name}/holdings"
-        if source_url != expected_url:
-            raise ValueError(f"Benchmark {name} has an unexpected source URL.")
-        as_of = record.get("as_of")
-        if not isinstance(as_of, str):
-            raise ValueError(f"Benchmark {name} is missing its snapshot date.")
-        snapshot_date = date.fromisoformat(as_of)
-        age_days = (date.today() - snapshot_date).days
-        if age_days < 0 or (age_days > MAX_SNAPSHOT_AGE_DAYS and not allow_stale):
-            raise ValueError(
-                f"Benchmark {name} snapshot date {as_of} is future-dated or older "
-                f"than {MAX_SNAPSHOT_AGE_DAYS} days."
-            )
-        benchmarks[name] = {
-            symbol: Decimal(str(weight))
-            for symbol, weight in record["weights"].items()
-        }
-        metadata[name] = {"as_of": as_of, "source_url": source_url}
-
-    errors = validate_benchmarks(benchmarks, expected_benchmarks)
-    if errors:
-        raise ValueError("Invalid Active Share benchmark data:\n- " + "\n- ".join(errors))
-    return benchmarks, metadata
-
-
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate a rule-checked AI CUP daily portfolio decision."
@@ -155,6 +157,14 @@ def create_parser() -> argparse.ArgumentParser:
         "--market",
         type=Path,
         help="Optional CSV with symbol,price[,score]; without it, --use-gemini fetches official daily quotes.",
+    )
+    parser.add_argument(
+        "--history",
+        type=Path,
+        help=(
+            "Optional official-history CSV with date,symbol,high,low,close,volume; "
+            "required with --market for technical indicators and ATR sizing."
+        ),
     )
     parser.add_argument(
         "--evidence",
@@ -190,24 +200,6 @@ def create_parser() -> argparse.ArgumentParser:
         type=Path,
         default=default_universe,
         help=f"JSON array of eligible symbols (default: {default_universe}).",
-    )
-    parser.add_argument(
-        "--benchmarks",
-        type=Path,
-        default=Path("outputs") / "active_etf_benchmarks.json",
-        help="Benchmark cache/output path.",
-    )
-    parser.add_argument(
-        "--offline-benchmarks",
-        action="store_true",
-        help="Use the existing benchmark cache instead of fetching fresh snapshots.",
-    )
-    default_etfs = Path(__file__).resolve().parents[2] / "data" / "active_etfs.json"
-    parser.add_argument(
-        "--active-etfs",
-        type=Path,
-        default=default_etfs,
-        help=f"Official active-ETF list (default: {default_etfs}).",
     )
     parser.add_argument("--output", type=Path, help="Write decision JSON to this path.")
     parser.add_argument(
@@ -247,6 +239,7 @@ def main() -> int:
             portfolio = Portfolio.from_json(_read_json(args.portfolio))
         else:
             raise ValueError("Provide either --portfolio or --datapack.")
+        allowed_symbols = _read_universe(args.universe)
         market_snapshot: MarketSnapshot | None = None
         if args.prelaunch_test and (args.market or not args.use_gemini):
             raise ValueError(
@@ -261,7 +254,6 @@ def main() -> int:
                     "Provide --market, or use --use-gemini to fetch official market data "
                     "and generate screening scores."
                 )
-            allowed_symbols = _read_universe(args.universe)
             requested_symbols = allowed_symbols | {
                 position.symbol for position in portfolio.positions
             }
@@ -282,6 +274,100 @@ def main() -> int:
                 allow_prelaunch_snapshot=args.prelaunch_test,
             )
             quotes = market_snapshot.quotes
+        technical_symbols = set(quotes) & allowed_symbols
+        if args.history:
+            history = _read_history(args.history, technical_symbols)
+        elif market_snapshot is not None:
+            history = fetch_official_price_history(
+                technical_symbols,
+                through_date=market_snapshot.trade_date,
+                tpex_symbols=market_snapshot.tpex_symbols,
+            )
+        else:
+            raise ValueError(
+                "--market requires --history to calculate MACD, RSI, moving "
+                "averages, and ATR."
+            )
+        if market_snapshot is not None:
+            stale_history = sorted(
+                symbol
+                for symbol, bars in history.items()
+                if bars
+                and (
+                    max(bar.date for bar in bars) > market_snapshot.trade_date
+                    or (
+                        market_snapshot.trade_date
+                        - max(bar.date for bar in bars)
+                    ).days > 4
+                )
+            )
+            if stale_history:
+                raise ValueError(
+                    "Historical prices are future-dated or stale for: "
+                    + ", ".join(stale_history)
+                )
+        technical_indicators: dict[str, TechnicalIndicators] = (
+            calculate_universe_indicators(history, technical_symbols)
+        )
+        if market_snapshot is not None and not args.history:
+            fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            technical_values: dict[str, float] = {}
+            for symbol, indicator in sorted(technical_indicators.items()):
+                for metric, value in (
+                    ("macd", indicator.macd),
+                    ("signal", indicator.signal),
+                    ("histogram", indicator.histogram),
+                    ("rsi_14", indicator.rsi),
+                    ("atr_14", indicator.atr),
+                    ("atr_pct", indicator.atr_pct),
+                    ("ma_20", indicator.ma20),
+                    ("ma_50", indicator.ma50),
+                    ("bullish_divergence", Decimal(int(indicator.bullish_divergence))),
+                    ("bearish_divergence", Decimal(int(indicator.bearish_divergence))),
+                ):
+                    if value is not None:
+                        technical_values[f"{symbol}_{metric}"] = float(value)
+            market_snapshot.evidence["sources"].extend(
+                [
+                    {
+                        "source_id": "S3",
+                        "authority": "twse",
+                        "name": "TWSE official historical daily stock quotes",
+                        "url": (
+                            f"{TWSE_DAILY_URL}?date={market_snapshot.trade_date:%Y%m%d}"
+                            "&type=ALLBUT0999&response=json"
+                        ),
+                        "content_as_of": (
+                            f"{market_snapshot.trade_date.isoformat()}T18:00:00+08:00"
+                        ),
+                        "fetched_at": fetched_at,
+                    },
+                    {
+                        "source_id": "S4",
+                        "authority": "tpex",
+                        "name": "TPEx official historical daily stock quotes",
+                        "url": TPEX_HISTORY_URL,
+                        "content_as_of": (
+                            f"{market_snapshot.trade_date.isoformat()}T18:00:00+08:00"
+                        ),
+                        "fetched_at": fetched_at,
+                    },
+                ]
+            )
+            market_snapshot.evidence["observations"].append(
+                {
+                    "obs_id": "O2",
+                    "source_ref": ["S3", "S4"],
+                    "topic": "technical_indicators",
+                    "statement": (
+                        f"MACD、RSI、ATR 與均線依截至 "
+                        f"{market_snapshot.trade_date.isoformat()} 的官方日線資料計算；"
+                        "每檔至少使用 26 個交易日；未達所需視窗的 50 日均線與 "
+                        "60 日背離訊號不加分也不扣分。"
+                    ),
+                    "values": technical_values,
+                }
+            )
         if args.dplan_output and datapack is not None:
             for holding in datapack.get("holdings", []):
                 if not isinstance(holding, dict) or not holding.get("shares", 0):
@@ -308,7 +394,9 @@ def main() -> int:
                 ),
                 Decimal("0"),
             )
-            if calculated_nav != Decimal(str(account["nav_tradable"])):
+            if not nav_values_match(
+                calculated_nav, Decimal(str(account["nav_tradable"]))
+            ):
                 raise ValueError(
                     "DataPack nav_tradable does not match cash plus held shares "
                     "at the supplied closing prices."
@@ -339,6 +427,7 @@ def main() -> int:
                 quotes,
                 allowed_symbols,
                 evidence=evidence,
+                technical_indicators=technical_indicators,
                 model=args.gemini_model,
             )
             quotes = {
@@ -356,45 +445,13 @@ def main() -> int:
                 )
                 for symbol, quote in quotes.items()
             }
-        expected_benchmarks = _read_universe(args.active_etfs)
-        if args.offline_benchmarks:
-            benchmarks, benchmark_metadata = _read_benchmarks(
-                args.benchmarks,
-                expected_benchmarks,
-                allow_stale=args.prelaunch_test,
-            )
-            if args.prelaunch_test:
-                today = date.today()
-                for name, metadata in benchmark_metadata.items():
-                    age_days = (
-                        today - date.fromisoformat(metadata["as_of"])
-                    ).days
-                    if age_days > MAX_SNAPSHOT_AGE_DAYS:
-                        print(
-                            "WARNING: Prelaunch test is using stale ETF benchmark "
-                            f"{name} from {metadata['as_of']} ({age_days} days old); "
-                            "do not submit this draft.",
-                            file=sys.stderr,
-                        )
-        else:
-            result = fetch_benchmarks(sorted(expected_benchmarks))
-            args.benchmarks.parent.mkdir(parents=True, exist_ok=True)
-            args.benchmarks.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            benchmarks, benchmark_metadata = _read_benchmarks(
-                args.benchmarks, expected_benchmarks
-            )
         decision = build_decision(
             portfolio,
             quotes,
             allowed_symbols,
-            benchmarks,
-            expected_benchmarks=expected_benchmarks,
+            technical_indicators=technical_indicators,
         )
         decision_json = decision.to_json()
-        decision_json["benchmark_metadata"] = benchmark_metadata
         if screening_scores is not None:
             decision_json["screening_scores"] = {
                 symbol: {
@@ -402,10 +459,32 @@ def main() -> int:
                         name: str(score)
                         for name, score in card.components.items()
                     },
+                    "technical_score": str(card.technical_score),
                     "total": str(card.total),
                 }
                 for symbol, card in sorted(screening_scores.items())
             }
+        decision_json["technical_indicators"] = {
+            symbol: {
+                "macd": str(indicator.macd),
+                "signal": str(indicator.signal),
+                "histogram": str(indicator.histogram),
+                "macd_cross": indicator.macd_cross,
+                "bullish_divergence": indicator.bullish_divergence,
+                "bearish_divergence": indicator.bearish_divergence,
+                "rsi_14": str(indicator.rsi),
+                "atr_14": str(indicator.atr),
+                "atr_pct": str(indicator.atr_pct),
+                "ma_20": str(indicator.ma20),
+                "ma_50": (
+                    str(indicator.ma50) if indicator.ma50 is not None else None
+                ),
+                "ma_20_rising": indicator.ma20_rising,
+                "ma_50_rising": indicator.ma50_rising,
+                "technical_score": str(indicator.technical_score),
+            }
+            for symbol, indicator in sorted(technical_indicators.items())
+        }
         output = json.dumps(decision_json, ensure_ascii=False, indent=2)
         dplan_json: dict[str, Any] | None = None
         if args.dplan_output:

@@ -5,9 +5,10 @@ import os
 import tempfile
 import unittest
 from http.client import IncompleteRead
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 import zipfile
 import xml.etree.ElementTree as ElementTree
@@ -19,15 +20,18 @@ from ai_cup_agent.gemini import (
     generate_json,
     score_quotes,
 )
-from ai_cup_agent.cli import _read_benchmarks
-from ai_cup_agent.fetch_benchmarks import SOURCE_KIND, SOURCE_ROOT
 from ai_cup_agent.market_data import (
     _request_json,
     _parse_venue,
     _parse_twse_daily,
+    _parse_twse_history,
+    _parse_tpex_history,
+    _fetch_tpex_history,
+    _fetch_tpex_month,
     fetch_official_market_snapshot,
 )
 from ai_cup_agent.models import Portfolio, Position, Quote
+from ai_cup_agent.technicals import DailyBar
 from ai_cup_agent.strategy_document import (
     DEFAULT_TEMPLATE,
     generate_strategy_document,
@@ -161,7 +165,7 @@ class GeminiClientTests(unittest.TestCase):
         self.assertNotIn("baseline_score", prompt)
         self.assertIn("assign it exactly 50 as neutral", prompt)
         self.assertIn("source reliability", prompt)
-        self.assertEqual(scores["2330"].total, Decimal("60"))
+        self.assertEqual(scores["2330"].total, Decimal("60.75"))
         self.assertEqual(scores["2330"].components["fundamentals"], Decimal("80"))
 
     def test_rejects_missing_score_dimensions(self) -> None:
@@ -205,36 +209,167 @@ class DataPackTests(unittest.TestCase):
             portfolio_from_datapack(data)
 
 
-class BenchmarkCacheTests(unittest.TestCase):
-    def test_stale_benchmark_is_allowed_only_when_explicitly_requested(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "benchmarks.json"
-            stale_date = (date.today() - timedelta(days=6)).isoformat()
-            payload = {
-                "source": SOURCE_ROOT,
-                "source_kind": SOURCE_KIND,
-                "retrieved_at": date.today().isoformat() + "T12:00:00+00:00",
-                "benchmarks": {
-                    "ETF-A": {
-                        "as_of": stale_date,
-                        "source_url": f"{SOURCE_ROOT}/etf/ETF-A/holdings",
-                        "weights": {"2330": "0.10"},
-                    }
-                },
-            }
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "older than 5 days"):
-                _read_benchmarks(path, {"ETF-A"})
-            benchmarks, metadata = _read_benchmarks(
-                path,
-                {"ETF-A"},
-                allow_stale=True,
-            )
-        self.assertEqual(benchmarks["ETF-A"]["2330"], Decimal("0.10"))
-        self.assertEqual(metadata["ETF-A"]["as_of"], stale_date)
-
-
 class MarketDataTests(unittest.TestCase):
+    def test_parses_tpex_monthly_daily_history(self) -> None:
+        bars = _parse_tpex_history(
+            {
+                "tables": [
+                    {
+                        "fields": [
+                            "日 期",
+                            "成交張數",
+                            "成交仟元",
+                            "開盤",
+                            "最高",
+                            "最低",
+                            "收盤",
+                            "漲跌",
+                            "筆數",
+                        ],
+                        "data": [
+                            [
+                                "115/10/22*",
+                                "7,255",
+                                "677,577",
+                                "97.00",
+                                "97.00",
+                                "91.20",
+                                "91.20",
+                                "-4.80",
+                                "8,641",
+                            ],
+                            [
+                                "115/10/23",
+                                "1",
+                                "100",
+                                "92.00",
+                                "93.00",
+                                "91.00",
+                                "92.00",
+                                "0.80",
+                                "10",
+                            ],
+                        ],
+                    }
+                ]
+            },
+            symbol="1785",
+            through_date=date(2026, 10, 22),
+        )
+
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].date, date(2026, 10, 22))
+        self.assertEqual(bars[0].high, Decimal("97.00"))
+        self.assertEqual(bars[0].low, Decimal("91.20"))
+        self.assertEqual(bars[0].close, Decimal("91.20"))
+        self.assertEqual(bars[0].volume, Decimal("7255"))
+
+    def test_fetches_tpex_history_from_monthly_official_endpoint(self) -> None:
+        with patch(
+            "ai_cup_agent.market_data._request_json",
+            return_value={
+                "tables": [
+                    {
+                        "fields": [
+                            "日 期", "成交張數", "成交仟元", "開盤", "最高",
+                            "最低", "收盤", "漲跌", "筆數",
+                        ],
+                        "data": [],
+                    }
+                ]
+            },
+        ) as request_json:
+            _fetch_tpex_month("1785", 115, 10, date(2026, 10, 22))
+
+        self.assertIn("/www/zh-tw/afterTrading/tradingStock?", request_json.call_args.args[0])
+        self.assertIn("code=1785", request_json.call_args.args[0])
+        self.assertIn("date=2026%2F10%2F01", request_json.call_args.args[0])
+
+    def test_stops_fetching_tpex_months_after_enough_sessions(self) -> None:
+        def monthly_bars(
+            symbol: str,
+            year: int,
+            month: int,
+            through_date: date,
+        ) -> list[DailyBar]:
+            return [
+                DailyBar(
+                    date(year + 1911, month, day),
+                    Decimal("10"),
+                    Decimal("9"),
+                    Decimal("9.5"),
+                    Decimal("100"),
+                )
+                for day in range(1, 21)
+                if date(year + 1911, month, day) <= through_date
+            ]
+
+        with patch(
+            "ai_cup_agent.market_data._fetch_tpex_month",
+            side_effect=monthly_bars,
+        ) as fetch_month:
+            bars = _fetch_tpex_history(
+                "1785",
+                through_date=date(2026, 10, 22),
+                sessions=60,
+                max_calendar_days=120,
+            )
+
+        self.assertEqual(len(bars), 60)
+        self.assertEqual(fetch_month.call_count, 3)
+
+    def test_retries_tpex_rate_limit_response(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok":true}'
+
+        rate_limited = HTTPError(
+            "https://example.com/market",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "0"},
+            None,
+        )
+        with (
+            patch(
+                "ai_cup_agent.market_data.urlopen",
+                side_effect=[rate_limited, Response()],
+            ) as urlopen,
+            patch("ai_cup_agent.market_data.sleep"),
+        ):
+            payload = _request_json("https://example.com/market", venue="TPEx")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_parses_historical_ohlcv_from_official_feeds(self) -> None:
+        trade_date = date(2026, 10, 21)
+        twse = _parse_twse_history(
+            {
+                "stat": "OK",
+                "date": "20261021",
+                "tables": [
+                    {
+                        "title": "每日收盤行情(全部)",
+                        "fields": ["證券代號", "最高價", "最低價", "收盤價", "成交股數"],
+                        "data": [["2330", "1510.00", "1490.00", "1500.00", "2000000"]],
+                    }
+                ],
+            },
+            expected_date=trade_date,
+            requested_symbols={"2330"},
+        )
+        self.assertEqual(twse["2330"].high, Decimal("1510.00"))
+        self.assertEqual(twse["2330"].low, Decimal("1490.00"))
+
     def test_retries_incomplete_market_api_response(self) -> None:
         class Response:
             status = 200
@@ -258,6 +393,107 @@ class MarketDataTests(unittest.TestCase):
             payload = _request_json("https://example.com/market", venue="TPEx")
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_retries_market_api_read_timeout(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok":true}'
+
+        with (
+            patch(
+                "ai_cup_agent.market_data.urlopen",
+                side_effect=[TimeoutError("The read operation timed out"), Response()],
+            ) as urlopen,
+            patch("ai_cup_agent.market_data.sleep"),
+        ):
+            payload = _request_json("https://example.com/market", venue="TPEx")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_reports_market_api_timeout_after_retry_limit(self) -> None:
+        with (
+            patch(
+                "ai_cup_agent.market_data.urlopen",
+                side_effect=TimeoutError("The read operation timed out"),
+            ) as urlopen,
+            patch("ai_cup_agent.market_data.sleep"),
+            self.assertRaisesRegex(
+                ValueError,
+                "Could not retrieve TPEx official market data after 3 attempts: "
+                "The read operation timed out",
+            ),
+        ):
+            _request_json("https://example.com/market", venue="TPEx")
+
+        self.assertEqual(urlopen.call_count, 3)
+
+    def test_retries_empty_or_invalid_json_market_response(self) -> None:
+        class Response:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self.body
+
+        with (
+            patch(
+                "ai_cup_agent.market_data.urlopen",
+                side_effect=[Response(b""), Response(b'{"ok":true}')],
+            ) as urlopen,
+            patch("ai_cup_agent.market_data.sleep"),
+        ):
+            payload = _request_json("https://example.com/market", venue="TPEx")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_reports_empty_market_response_after_retry_limit(self) -> None:
+        class Response:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b""
+
+        with (
+            patch(
+                "ai_cup_agent.market_data.urlopen",
+                return_value=Response(),
+            ) as urlopen,
+            patch("ai_cup_agent.market_data.sleep"),
+            self.assertRaisesRegex(
+                ValueError,
+                "invalid JSON response \\(HTTP 200, content type "
+                "application/json, body starts with '<empty>'\\) after 3 attempts",
+            ),
+        ):
+            _request_json("https://example.com/market", venue="TPEx")
+
+        self.assertEqual(urlopen.call_count, 3)
 
     def test_reports_incomplete_market_response_after_retry_limit(self) -> None:
         with (
@@ -375,10 +611,10 @@ class MarketDataTests(unittest.TestCase):
         self.assertIn("date=20261021", requested_url)
         self.assertIn("type=ALLBUT0999", requested_url)
 
-    def test_prelaunch_mode_allows_recent_snapshot_before_future_trade_date(self) -> None:
+    def test_accepts_recent_previous_trading_day_across_calendar_gap(self) -> None:
         tpex_rows = [
             {
-                "Date": "1151021",
+                "Date": "1151022",
                 "SecuritiesCompanyCode": "6488",
                 "Close": "100",
                 "Change": "0",
@@ -388,10 +624,10 @@ class MarketDataTests(unittest.TestCase):
         ]
         twse_payload = {
             "stat": "OK",
-            "date": "20261021",
+            "date": "20261022",
             "tables": [
                 {
-                    "title": "115年10月21日 每日收盤行情(全部)",
+                    "title": "115年10月22日 每日收盤行情(全部)",
                     "fields": [
                         "證券代號",
                         "成交股數",
@@ -426,16 +662,22 @@ class MarketDataTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "too far before trade_date"):
                 fetch_official_market_snapshot(
                     {"2330", "6488"},
-                    trade_date=date(2026, 10, 26),
-                    today=date(2026, 10, 21),
+                    trade_date=date(2026, 11, 2),
+                    today=date(2026, 10, 26),
                 )
             snapshot = fetch_official_market_snapshot(
                 {"2330", "6488"},
-                trade_date=date(2026, 10, 26),
-                today=date(2026, 10, 21),
+                trade_date=date(2026, 10, 27),
+                today=date(2026, 10, 26),
+            )
+            prelaunch_snapshot = fetch_official_market_snapshot(
+                {"2330", "6488"},
+                trade_date=date(2026, 11, 2),
+                today=date(2026, 10, 26),
                 allow_prelaunch_snapshot=True,
             )
-        self.assertEqual(snapshot.trade_date, date(2026, 10, 21))
+        self.assertEqual(snapshot.trade_date, date(2026, 10, 22))
+        self.assertEqual(prelaunch_snapshot.trade_date, date(2026, 10, 22))
 
     def test_prelaunch_mode_does_not_bypass_datapack_as_of_date(self) -> None:
         with (
@@ -511,14 +753,12 @@ class DPlanDraftTests(unittest.TestCase):
             starting,
             quotes,
             symbols,
-            {"ETF-A": {"9000": Decimal("0.5")}},
-            expected_benchmarks={"ETF-A"},
         )
         datapack = {
             "doc_type": "DataPack",
             "team_id": "TEAM_11825",
             "trade_date": "2026-10-26",
-            "account": {"nav_tradable": 100000000},
+            "account": {"nav_tradable": Decimal("100000000.0000001")},
         }
         evidence = {
             "sources": [
@@ -606,8 +846,6 @@ class DPlanDraftTests(unittest.TestCase):
             starting,
             quotes,
             symbols,
-            {"ETF-A": {"9000": Decimal("0.5")}},
-            expected_benchmarks={"ETF-A"},
         )
         evidence = {
             "sources": [

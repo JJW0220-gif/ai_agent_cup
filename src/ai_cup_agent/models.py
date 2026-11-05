@@ -47,7 +47,6 @@ class AgentDecision:
     orders: tuple[Order, ...]
     projected_portfolio: Portfolio
     nav: Decimal
-    active_share_by_benchmark: dict[str, Decimal]
     rationale: str
 
     def to_json(self) -> dict[str, Any]:
@@ -64,9 +63,5 @@ class AgentDecision:
                 ],
             },
             "nav": str(self.nav),
-            "active_share_by_benchmark": {
-                name: str(value)
-                for name, value in self.active_share_by_benchmark.items()
-            },
             "rationale": self.rationale,
         }

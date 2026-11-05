@@ -6,12 +6,11 @@ from typing import Mapping
 from ai_cup_agent.models import AgentDecision, Order, Portfolio, Position, Quote
 from ai_cup_agent.rules import (
     LOT_SIZE,
-    active_share,
     cash_after_order,
     portfolio_nav,
-    validate_benchmarks,
     validate_portfolio,
 )
+from ai_cup_agent.technicals import TechnicalIndicators, atr_adjusted_weights
 
 ZERO = Decimal("0")
 RETENTION_RANK = 30
@@ -81,11 +80,10 @@ def build_decision(
     portfolio: Portfolio,
     quotes: Mapping[str, Quote],
     allowed_symbols: set[str],
-    benchmarks: Mapping[str, Mapping[str, Decimal]],
     *,
-    expected_benchmarks: set[str],
     target_holdings: int = 22,
     target_cash_weight: Decimal = Decimal("0.10"),
+    technical_indicators: Mapping[str, TechnicalIndicators] | None = None,
 ) -> AgentDecision:
     if not 20 <= target_holdings <= 30:
         raise ValueError("target_holdings must be between 20 and 30.")
@@ -93,10 +91,6 @@ def build_decision(
         raise ValueError("target_cash_weight must be between 0 and 25%.")
     if any(quote.price <= ZERO for quote in quotes.values()):
         raise ValueError("All quote prices must be positive.")
-    benchmark_errors = validate_benchmarks(benchmarks, expected_benchmarks)
-    if benchmark_errors:
-        raise ValueError("Invalid Active Share benchmark data:\n- " + "\n- ".join(benchmark_errors))
-
     prices = {symbol: quote.price for symbol, quote in quotes.items()}
     nav = portfolio_nav(portfolio, prices)
     if nav <= ZERO:
@@ -136,10 +130,20 @@ def build_decision(
         for quote in ranked
         if quote.symbol not in selected_symbols
     ][:target_holdings - len(retained)]
-    target_invested_value = nav * (Decimal("1") - target_cash_weight)
-    per_stock_target = target_invested_value / Decimal(target_holdings)
+    if technical_indicators is None:
+        target_weights = {
+            quote.symbol: (Decimal("1") - target_cash_weight)
+            / Decimal(target_holdings)
+            for quote in selected
+        }
+    else:
+        target_weights = atr_adjusted_weights(
+            [quote.symbol for quote in selected],
+            technical_indicators,
+            total_weight=Decimal("1") - target_cash_weight,
+        )
     target_shares = {
-        quote.symbol: _round_lots(per_stock_target, quote.price)
+        quote.symbol: _round_lots(nav * target_weights[quote.symbol], quote.price)
         for quote in selected
     }
     if any(shares == 0 for shares in target_shares.values()):
@@ -174,7 +178,7 @@ def build_decision(
             ),
         )
         errors = validate_portfolio(
-            projected_portfolio, prices, allowed_symbols, benchmarks, expected_benchmarks
+            projected_portfolio, prices, allowed_symbols
         )
         if cash < ZERO:
             errors.append(f"Planned orders would make cash negative ({cash}).")
@@ -185,30 +189,29 @@ def build_decision(
         REBALANCE_THRESHOLD,
     )
     turnover_exception = not portfolio.positions
+    turnover_blocked = False
     if errors and turnover_limit is not None:
-        orders, projected, errors = build_projected(None, ZERO)
-        turnover_exception = True
+        orders, projected, errors = build_projected(turnover_limit, ZERO)
+    if errors and turnover_limit is not None:
+        starting_errors = validate_portfolio(portfolio, prices, allowed_symbols)
+        if starting_errors:
+            raise ValueError(
+                "The turnover cap prevents a compliant rebalance, and the "
+                "starting portfolio is already invalid:\n- "
+                + "\n- ".join(starting_errors)
+            )
+        orders = []
+        projected = portfolio
+        errors = []
+        turnover_blocked = True
     if errors:
         raise ValueError("Projected portfolio failed rule checks:\n- " + "\n- ".join(errors))
 
     nav_after_costs = portfolio_nav(projected, prices)
-    projected_weights = {
-        position.symbol: Decimal(position.shares) * prices[position.symbol] / nav_after_costs
-        for position in sorted(
-            projected.positions,
-            key=lambda item: item.shares * prices[item.symbol],
-            reverse=True,
-        )[:15]
-    }
-    shares_by_benchmark = {
-        name: active_share(projected_weights, weights)
-        for name, weights in benchmarks.items()
-    }
     return AgentDecision(
         orders=tuple(orders),
         projected_portfolio=projected,
         nav=nav_after_costs,
-        active_share_by_benchmark=shares_by_benchmark,
         rationale=(
             f"Ranked eligible stocks by supplied model score, retained existing "
             f"holdings through rank {RETENTION_RANK}, and selected {target_holdings} "
@@ -216,13 +219,25 @@ def build_decision(
             f"an existing holding deviated by at least "
             f"{REBALANCE_THRESHOLD:.1%} of NAV. "
             + (
-                "The daily turnover cap was waived for initial establishment or "
-                "to restore competition-rule compliance. "
+                "Target position sizes were adjusted using 14-session ATR as a "
+                "volatility proxy, bounded to +/-25% of equal weight. "
+                if technical_indicators is not None
+                else "Target position sizes are equal weight. "
+            )
+            + (
+                "The 20% gross turnover cap prevented a compliant rebalance; "
+                "all trades were deferred to preserve portfolio compliance. "
+                if turnover_blocked
+                else ""
+            )
+            + (
+                "The daily turnover cap was waived for initial portfolio "
+                "establishment. "
                 if turnover_exception
                 else f"Gross daily turnover was capped at "
                 f"{DAILY_TURNOVER_LIMIT:.0%} of NAV. "
             )
-            + "Validated the projected portfolio against configured competition "
-            "constraints."
+            + "Validated the projected portfolio against configured position, "
+            "cash, universe, and trading constraints."
         ),
     )

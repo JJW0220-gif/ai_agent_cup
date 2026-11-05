@@ -23,6 +23,10 @@ TIMESTAMP_PATTERN = re.compile(
 )
 
 
+def nav_values_match(expected: Decimal, reported: Decimal) -> bool:
+    return abs(expected - reported) < Decimal("0.01")
+
+
 def portfolio_from_datapack(data: Any) -> tuple[Portfolio, dict[str, Any]]:
     if not isinstance(data, dict) or data.get("doc_type") != "DataPack":
         raise ValueError("The supplied file is not a DataPack.")
@@ -611,7 +615,7 @@ def build_dplan_draft(
         ),
         Decimal("0"),
     )
-    if expected_nav != previous_nav:
+    if not nav_values_match(expected_nav, previous_nav):
         raise ValueError(
             "DataPack nav_tradable does not match cash plus held shares at the "
             "supplied closing prices."
